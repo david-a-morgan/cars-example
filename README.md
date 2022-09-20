@@ -1,94 +1,81 @@
-# cars-example
-// TODO(user): Add simple overview of use/purpose
+# Car Colored Controller
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+This is a minimal implementation to reproduce what I believe to be unintentional behavior in [controller-runtime](https://pkg.go.dev/sigs.k8s.io/controller-runtime).
 
-## Getting Started
-You’ll need a Kubernetes cluster to run against. You can use [KIND](https://sigs.k8s.io/kind) to get a local cluster for testing, or run against a remote cluster.
-**Note:** Your controller will automatically use the current context in your kubeconfig file (i.e. whatever cluster `kubectl cluster-info` shows).
+This project was skaffolded out with [kubebuilder](https://book.kubebuilder.io/quick-start.html) and contains a single controller that reconciles Car custom resources. The reconcile logic is intentionally simple; create/update a ConfigMap with the labels from the owning Car object.
 
-### Running on the cluster
-1. Install Instances of Custom Resources:
+The believed unintended, and frankly unintuitive, behavior in controller-runtime relates to how events for owned objects are not filtered by any predicates that might be set on the controlled type.
 
-```sh
-kubectl apply -f config/samples/
+## Background
+
+controller-runtime contains a [builder package](https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/builder) that allows, surprise, building a controller. Importantly, the controller can be associated with with one type to be reconciled (the [_For_](https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/builder#Builder.For) type) and any number of types that are generated and owned by the _For_ type (the [_Owned_](https://github.com/kubernetes-sigs/controller-runtime/blob/v0.13.0/pkg/builder/controller.go#L106) types). The controller will receive a reconcile request for a _For_ object whenever one of its _Owned_ types is created/updated/deleted.
+
+Additionally, both the _For_ type and the _Owned_ types can have predicates that will filter the create/update/delete events. Filtered events will not generate a reconcile request for the appropriate _For_ object.
+
+## The Unexpected Behavior
+
+Given a simple predicate:
+
+```
+prd, _ := predicate.LabelSelectorPredicate(metav1.LabelSelector{
+    MatchLabels: map[string]string{"color": "red"},
+})
 ```
 
-2. Build and push your image to the location specified by `IMG`:
-	
-```sh
-make docker-build docker-push IMG=<some-registry>/cars-example:tag
-```
-	
-3. Deploy the controller to the cluster with the image specified by `IMG`:
+We now associate that predicate to our _For_ type, which has one _Owned_ type:
 
-```sh
-make deploy IMG=<some-registry>/cars-example:tag
+```
+ctrl.NewControllerManagedBy(mgr).
+    For(&api.Car{}, builder.WithPredicates(prd)).
+    Owns(&corev1.ConfigMap{}).
+    Complete(r)
 ```
 
-### Uninstall CRDs
-To delete the CRDs from the cluster:
+So with the above we have a controller that will manage `Car` objects that have the label `color` equal to `red`. If a user creates a `Car` object with the label `color` set to `blue` this controller won't receive any reconcile events for that new, blue `Car` object.
 
-```sh
-make uninstall
-```
+The unexpected occurs when the owned `ConfigMap` receives a create/update/delete event:
 
-### Undeploy controller
-UnDeploy the controller to the cluster:
+Let's assume we have two `Car` controllers; one for `Car` objects labeled `red` and one for `Car` objects labeled `blue`. A user creates a `Car` labeled `blue`. The red controller gets no reconcile request for the new, blue `Car` while the blue controller does receive a reconcile request. The blue controller then creates the owned `ConfigMap` (the blue `ConfigMap`) for the blue `Car`.
 
-```sh
-make undeploy
-```
+Now a new create event is published for the blue `ConfigMap`. As expected the blue controller translates that blue `ConfigMap` create event into a reconcile request for the blue `Car`. Unexpectedly, however, the red controller also translates that create event into a reconcile request, also for the blue `Car`. Where things blow up is that red controller generated reconcile request for a blue `Car` is handled by the red controller! Our red controller, which should handle **only** red `Car` objects is trying to handle a blue `Car`.
 
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
+In this scenario the create/update/delete event for the blue `ConfigMap` ignores any predicates we have set for our _For_ type. At first blush this seems correct; we haven't specified any predicates for the _Owned_ type. However, because the event on the _Owned_ type gets translated to a reconcile request for the _For_ type this appears to be a way to bypass any filtering a controller expects for its _For_ type. It is unintutive that an event on an _Owned_ object can cause a controller that should **not** handle some _For_ objects to try to reconcile them.
 
-### How it works
-This project aims to follow the Kubernetes [Operator pattern](https://kubernetes.io/docs/concepts/extend-kubernetes/operator/)
+## Running this minimal reproduction
 
-It uses [Controllers](https://kubernetes.io/docs/concepts/architecture/controller/) 
-which provides a reconcile function responsible for synchronizing resources untile the desired state is reached on the cluster 
+This repo can be run with any local K8S cluster. I used Docker Desktop. If you're using a non-local K8S cluster make sure to push the built image to your Docker registry and update the image declarations in `manifest.yaml`.
 
-### Test It Out
-1. Install the CRDs into the cluster:
+1. `make docker-build`
+1. `kubectl apply -f manifest.yaml`<br/>
+    At this point you should have two controller pods running; one for red and one for blue. The controller logs will also note which color they are controlling.
+1. `kubectl apply -f blue-car.yaml`<br/>
+    Things will blow up now. The blue controller is fine:
+    ```
+    1.663698181430378e+09	INFO	reconciling car	{"controller": "car", "controllerGroup": "example.example.com", "controllerKind": "Car", "car": {"name":"car-blue","namespace":"cars-example-system"}, "namespace": "cars-example-system", "name": "car-blue", "reconcileID": "2bdc4863-1c90-452b-97ec-97e8b0ecee99", "car color": "blue", "controller color": "blue"}
+    1.663698181447545e+09	INFO	reconciling car	{"controller": "car", "controllerGroup": "example.example.com", "controllerKind": "Car", "car": {"name":"car-blue","namespace":"cars-example-system"}, "namespace": "cars-example-system", "name": "car-blue", "reconcileID": "dd997990-0f18-4324-8fb2-1e143271e18d", "car color": "blue", "controller color": "blue"}
+    ```
+    The red controller, however, is not:
+    ```
+    1.6636981814459648e+09	INFO	reconciling car	{"controller": "car", "controllerGroup": "example.example.com", "controllerKind": "Car", "car": {"name":"car-blue","namespace":"cars-example-system"}, "namespace": "cars-example-system", "name": "car-blue", "reconcileID": "379900d7-2826-4d36-9bf9-cd26a7428bbd", "car color": "blue", "controller color": "red"}
+    1.6636981814461052e+09	ERROR	!!!car color does not match controller color!!!	{"controller": "car", "controllerGroup": "example.example.com", "controllerKind": "Car", "car": {"name":"car-blue","namespace":"cars-example-system"}, "namespace": "cars-example-system", "name": "car-blue", "reconcileID": "379900d7-2826-4d36-9bf9-cd26a7428bbd"}
+    sigs.k8s.io/controller-runtime/pkg/internal/controller.(*Controller).Reconcile
+        /go/pkg/mod/sigs.k8s.io/controller-runtime@v0.12.2/pkg/internal/controller/controller.go:121
+    sigs.k8s.io/controller-runtime/pkg/internal/controller.(*Controller).reconcileHandler
+        /go/pkg/mod/sigs.k8s.io/controller-runtime@v0.12.2/pkg/internal/controller/controller.go:320
+    sigs.k8s.io/controller-runtime/pkg/internal/controller.(*Controller).processNextWorkItem
+        /go/pkg/mod/sigs.k8s.io/controller-runtime@v0.12.2/pkg/internal/controller/controller.go:273
+    sigs.k8s.io/controller-runtime/pkg/internal/controller.(*Controller).Start.func2.2
+        /go/pkg/mod/sigs.k8s.io/controller-runtime@v0.12.2/pkg/internal/controller/controller.go:234
+    ```
 
-```sh
-make install
-```
+So what's going on? We have two reconcile requests in the blue controller for the blue `Car`: one for the create of the `Car` itself and one for the create of the owned `ConfigMap`.
 
-2. Run your controller (this will run in the foreground, so switch to a new terminal if you want to leave it running):
+In the red controller we get one reconcile request: the create of the blue owned `ConfigMap`. The create event gets translated into a reconcile request for the blue `Car`.
 
-```sh
-make run
-```
+## The Fix?
 
-**NOTE:** You can also run this in one step by running: `make install run`
+Ideally this would be handled in controller-runtime in a more intutive way. Events for _Owned_ objects will run the owner object through the _For_ predicates before publishing a reconcile request.
 
-### Modifying the API definitions
-If you are editing the API definitions, generate the manifests such as CRs or CRDs using:
+Alternatively you can set an additional predicate on each _Owned_ type. You'll need to write a predicate that gets the owner of the object that generated the event and check that owner object like the predicate used for the _For_ type. [controller-runtime/pkg/handler/EnqueueRequestForOwner](https://github.com/kubernetes-sigs/controller-runtime/blob/v0.13.0/pkg/handler/enqueue_owner.go#L119) shows a way to go from event to owner.
 
-```sh
-make manifests
-```
-
-**NOTE:** Run `make --help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
-## License
-
-Copyright 2022.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+A quicker, dirtier way is just repeat your predicate logic in the reconcile method of your controller.
