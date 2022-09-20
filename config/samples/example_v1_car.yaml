@@ -1,0 +1,6 @@
+apiVersion: example.example.com/v1
+kind: Car
+metadata:
+  name: car-sample
+spec:
+  # TODO(user): Add fields here
