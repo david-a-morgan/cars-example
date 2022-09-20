@@ -1,0 +1,8 @@
+apiVersion: example.example.com/v1
+kind: Car
+metadata:
+  namespace: cars-example-system
+  name: car-blue
+  labels:
+    color: blue
+spec: {}
